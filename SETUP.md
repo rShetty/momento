@@ -1,214 +1,364 @@
-# KreditKard Setup Guide
+# Detailed Setup Guide
+
+This guide walks you through every step of setting up KreditKard from scratch.
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#prerequisites)
+2. [Telegram Bot Setup](#telegram-bot-setup)
+3. [Gmail OAuth Setup](#gmail-oauth-setup)
+4. [Environment Configuration](#environment-configuration)
+5. [First Run](#first-run)
+6. [Cron Setup](#cron-setup)
+7. [Troubleshooting](#troubleshooting)
+
+---
 
 ## Prerequisites
-- Python 3.11+
-- A VPS or always-on machine (Ubuntu recommended)
-- `cron` for scheduling
+
+- Python 3.11 or higher
+- A Gmail account
+- A Telegram account
+- A VPS, Raspberry Pi, or always-on computer (for cron)
+- Git
 
 ---
 
-## 1. Telegram Bot Token & Chat ID
+## Telegram Bot Setup
 
-### Create a Bot
-1. Open Telegram and search for **@BotFather**
-2. Send `/newbot`
-3. Follow prompts to name your bot (e.g., `kreditkard_bot`)
-4. **BotFather will reply with your token:**
+### Step 1: Create a Bot with BotFather
+
+1. Open **Telegram** on your phone or desktop
+2. Search for: **`@BotFather`**
+3. Click **Start** or send `/start`
+4. Send `/newbot`
+5. BotFather asks for a name:
+   - Type: `KreditKard`
+6. BotFather asks for a username:
+   - Type: `yourname_kard_bot` (must end in `_bot`, must be globally unique)
+   - If taken, try `yourname_kreditkard_bot` or similar
+7. **BotFather replies with your token:**
    ```
+   Done! Congratulations on your new bot.
+   You will find it at t.me/yourname_kard_bot
+   
+   Use this token to access the HTTP API:
    123456789:ABCdefGHIjklMNOpqrSTUvwxyz
    ```
-   Copy this into `TELEGRAM_BOT_TOKEN=` in your `.env` file.
 
-### Get Your Chat ID
-1. Message your new bot `/start`
-2. Visit this URL in your browser (replace `<TOKEN>`):
-   ```
-   https://api.telegram.org/bot<TOKEN>/getUpdates
-   ```
-3. Look for `"chat":{"id":12345678` — that number is your `TELEGRAM_CHAT_ID`
+8. **Copy that token immediately** — you'll never see it again in full
 
----
+### Step 2: Get Your Chat ID
 
-## 2. Gmail OAuth Token
+1. Find your bot in Telegram (search `@yourname_kard_bot`)
+2. Click **Start** or send any message like `/start` or `hello`
+3. The bot needs at least one message to identify your chat
 
-KreditKard uses **read-only** Gmail access. You need an OAuth 2.0 access token.
+### Step 3: Test the Bot
 
-### Method A: Google Cloud Console (Recommended for long-term use)
+After setting up `.env` (see below), run:
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project (e.g., `kreditkard`)
-3. Navigate to **APIs & Services > Library**
-4. Search for **Gmail API** and click **Enable**
-5. Go to **APIs & Services > OAuth consent screen**
-   - Choose **External** (or Internal if GSuite)
-   - Fill in app name: `KreditKard`
-   - Add scope: `https://www.googleapis.com/auth/gmail.readonly`
-   - Add your email as a test user
-6. Go to **Credentials > Create Credentials > OAuth client ID**
-   - Application type: **Desktop app**
-   - Name: `KreditKard Desktop`
-7. Download the JSON file (`client_secret_*.json`)
-8. Use this Python script to get your token:
+```bash
+python -c "
+from telegram import Bot
+import asyncio
 
-```python
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-import json
+async def test():
+    bot = Bot(token='YOUR_TOKEN_HERE')
+    me = await bot.get_me()
+    print(f'Bot: @{me.username}')
+    
+    updates = await bot.get_updates()
+    if updates:
+        chat_id = updates[-1].message.chat.id
+        print(f'Chat ID: {chat_id}')
+        
+        await bot.send_message(
+            chat_id=chat_id,
+            text='🤖 KreditKard is online!'
+        )
+        print('Test message sent!')
 
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-
-flow = InstalledAppFlow.from_client_secrets_file(
-    'client_secret_XXXX.json', SCOPES)
-creds = flow.run_local_server(port=0)
-
-print('Access token:', creds.token)
-print('Refresh token:', creds.refresh_token)
+asyncio.run(test())
+"
 ```
 
-9. Copy the **Access token** into `GMAIL_OAUTH_TOKEN=` in your `.env`
-
-### Method B: Google OAuth Playground (Quick & Easy)
-
-1. Visit [Google OAuth 2.0 Playground](https://developers.google.com/oauthplayground/)
-2. Click the **gear icon** (⚙️) in top right
-   - Check **"Use your own OAuth credentials"**
-   - Enter your Client ID and Client Secret from Step 6 above
-3. In the left panel, select **Gmail API v1 > https://www.googleapis.com/auth/gmail.readonly**
-4. Click **Authorize APIs** → sign in with your Gmail
-5. Click **Exchange authorization code for tokens**
-6. Copy the **Access token** into your `.env`
-
-> ⚠️ Access tokens expire. For production, store the **Refresh token** and implement auto-refresh (KreditKard currently uses long-lived tokens).
+You should receive a message from your bot.
 
 ---
 
-## 3. OpenRouter API Key (Optional)
+## Gmail OAuth Setup
 
-Only needed for LLM fallback on unknown bank statements.
+### Overview
 
-1. Visit [OpenRouter](https://openrouter.ai/)
-2. Sign up and get an API key
-3. Copy into `OPENROUTER_API_KEY=` in `.env`
+KreditKard uses **OAuth2** (not your Gmail password) to read emails. This is more secure and is the standard way apps access Gmail.
 
-Default model: `mistralai/mistral-7b-instruct` (cheap, ~$0.50-1/month for 10 statements)
+### Step 1: Create a Google Cloud Project
+
+1. Go to: https://console.cloud.google.com/
+2. Sign in with the Gmail account you want to monitor
+3. Click the project selector (top left)
+4. Click **"New Project"**
+5. Name it: `KreditKard`
+6. Click **Create**
+
+### Step 2: Enable Gmail API
+
+1. In your new project, go to: **APIs & Services → Library**
+2. Search for: **"Gmail API"**
+3. Click **Gmail API**
+4. Click **ENABLE**
+5. Wait for it to activate (takes ~1 minute)
+
+### Step 3: Configure OAuth Consent Screen
+
+1. Go to: **APIs & Services → OAuth consent screen**
+2. Choose **External** (or Internal if you have Google Workspace)
+3. Click **Create**
+4. Fill in:
+   - **App name**: `KreditKard`
+   - **User support email**: Your email
+   - **Developer contact email**: Your email
+5. Click **Save and Continue**
+6. On **Scopes** page:
+   - Click **Add or Remove Scopes**
+   - Search for: `https://www.googleapis.com/auth/gmail.readonly`
+   - Check the box
+   - Click **Update**
+   - Click **Save and Continue**
+7. On **Test users** page:
+   - Click **+ ADD USERS**
+   - Enter your Gmail address
+   - Click **Add**
+   - Click **Save and Continue**
+8. Review and click **Back to Dashboard**
+
+### Step 4: Create OAuth Credentials
+
+1. Go to: **APIs & Services → Credentials**
+2. Click **+ CREATE CREDENTIALS → OAuth client ID**
+3. Application type: **Web application**
+4. Name: `KreditKard Desktop`
+5. Under **Authorized redirect URIs**:
+   - Click **+ ADD URI**
+   - Enter: `http://localhost:8080`
+   - (This is where our local auth server listens)
+6. Click **CREATE**
+7. A popup appears with your **Client ID** and **Client Secret**
+8. Click **DOWNLOAD JSON**
+9. Save the file to your project directory
+   - Filename will be like: `client_secret_123456789-xxx.apps.googleusercontent.com.json`
+
+### Step 5: Run Authentication
+
+```bash
+python auth.py
+```
+
+This will:
+1. Start a local server on `http://localhost:8080`
+2. Open your browser to Google's OAuth page
+3. Ask you to select your Gmail account and approve
+4. Redirect back to localhost with an auth code
+5. Exchange the code for access + refresh tokens
+6. Save `token.json` (this is your permanent key — keep it safe)
+
+**Note:** `token.json` contains your refresh token. Do not share or commit it.
 
 ---
 
-## 4. Configuration
+## Environment Configuration
 
-Create `.env` from the example:
+Create `.env` in the project root:
 
 ```bash
 cp .env.example .env
-nano .env
 ```
 
-Fill in:
-```env
-GMAIL_OAUTH_TOKEN=ya29.a0AR...
-OPENROUTER_API_KEY=sk-or-v1-...
-TELEGRAM_BOT_TOKEN=123456789:ABCdef...
-TELEGRAM_CHAT_ID=12345678
-TELEGRAM_BOT_USERNAME=@kreditkard_bot
-```
+Edit `.env` with your actual values:
 
-Optional tuning:
 ```env
+# Gmail (OAuth - you don't need to fill these manually, auth.py handles it)
+# Just keep empty — auth.py creates token.json
+GMAIL_OAUTH_TOKEN=
+
+# Telegram (required)
+TELEGRAM_BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID_HERE
+TELEGRAM_BOT_USERNAME=@kredit_kard_bot
+
+# LLM (optional — leave blank to skip LLM features)
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=mistralai/mistral-7b-instruct
+
+# Behaviour
 CHECK_TIME=08:00
 REMINDER_DAYS_BEFORE=7
 MAX_REMINDERS_TODAY=1
-READ_EMAIL_DAYS_BACK=3
+READ_EMAIL_DAYS_BACK=30
+```
+
+### Getting Your Chat ID Programmatically
+
+After messaging your bot `/start`, run:
+
+```python
+from telegram import Bot
+import asyncio
+
+async def main():
+    bot = Bot(token='YOUR_BOT_TOKEN')
+    updates = await bot.get_updates()
+    for u in updates:
+        print(f"Chat ID: {u.message.chat.id}")
+        print(f"User: {u.message.from_user.first_name}")
+
+asyncio.run(main())
 ```
 
 ---
 
-## 5. Install & Run
+## First Run
+
+### Test Gmail Connection
 
 ```bash
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+python -c "
+from gmail_client import test_connection
+result = test_connection()
+print(f'Email: {result[\"email\"]}')
+print(f'Messages: {result[\"messages_total\"]}')
+"
+```
 
-# Install dependencies
-pip install -r requirements.txt
+### Run Full Pipeline
 
-# Initialize DB and run once manually
+```bash
 python main.py
 ```
 
+You should see output like:
+```
+[main] Found 7 statement emails.
+[main] Matched to registered card: Swiggy Card
+[main] Saved bill via pattern: ...
+```
+
+### Start Telegram Bot (for commands)
+
+In a separate terminal:
+
+```bash
+python telegram_bot.py
+```
+
+The bot will start polling for commands like `/status`, `/paid`, `/register`.
+
 ---
 
-## 6. Schedule with Cron
+## Cron Setup
+
+Edit your crontab:
 
 ```bash
 crontab -e
 ```
 
-Add this line (runs daily at 8:00 AM):
+Add this line to run every morning at 8 AM:
+
 ```cron
-0 8 * * * cd /opt/kreditkard && /opt/kreditkard/.venv/bin/python main.py >> /opt/kreditkard/run.log 2>&1
+0 8 * * * cd /path/to/momento && /path/to/momento/.venv/bin/python main.py >> /path/to/momento/run.log 2>&1
 ```
 
----
+For testing, run every 5 minutes:
 
-## 7. Run Telegram Bot (Optional)
+```cron
+*/5 * * * * cd /path/to/momento && /path/to/momento/.venv/bin/python main.py >> /path/to/momento/run.log 2>&1
+```
 
-For two-way commands (`/paid`, `/status`, `/teach`):
+**Note:** The `telegram_bot.py` should run as a systemd service or in a `screen`/`tmux` session since it needs to stay alive to accept commands.
+
+### Systemd Service (for VPS)
+
+Create `/etc/systemd/system/kreditkard-bot.service`:
+
+```ini
+[Unit]
+Description=KreditKard Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/path/to/momento
+ExecStart=/path/to/momento/.venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
 
 ```bash
-# In a separate terminal or screen/tmux session
-source .venv/bin/activate
-python telegram_bot.py
-```
-
-Or run it as a systemd service for production.
-
----
-
-## Commands
-
-| Command | Action |
-|---|---|
-| `/start` | Show help |
-| `/status` | List all pending dues |
-| `/paid hdfc` | Mark latest HDFC bill as paid |
-| `/forcecheck` | Run Gmail scan immediately |
-| `/teach axis due:25-05-2026 amount:45320 ...` | Teach the bot a new pattern |
-| `/confirm axis due:25-05-2026 amount:45320 ...` | Confirm LLM guess and learn |
-| `/patterns hdfc` | Show learned patterns for HDFC |
-| `/history hdfc` | Show recent HDFC bills |
-
----
-
-## File Structure
-
-```
-kreditkard/
-├── main.py                  # Cron entry point
-├── telegram_bot.py          # Bot command handlers
-├── config.py                # .env loader
-├── db.py                    # SQLite layer
-├── utils.py                 # Date/amount/text helpers
-├── gmail_client.py          # Gmail API wrapper
-├── pdf_extractor.py         # PyMuPDF wrapper
-├── hdfc_extractor.py        # HDFC-specific parser
-├── pattern_matcher.py       # Generic pattern engine
-├── pattern_generator.py     # Auto-pattern builder
-├── llm_client.py            # OpenRouter fallback
-├── payment_detector.py      # Payment email scanner
-├── reminder.py              # Telegram reminder sender
-├── .env                     # Secrets (gitignored)
-├── requirements.txt
-├── kreditkard.db            # SQLite DB (gitignored)
-└── pdfs/                    # Downloaded PDFs (gitignored)
+sudo systemctl enable kreditkard-bot
+sudo systemctl start kreditkard-bot
+sudo systemctl status kreditkard-bot
 ```
 
 ---
 
-## Security Notes
+## Troubleshooting
 
-- `.env` and `kreditkard.db` are in `.gitignore` — **never commit them**
-- Set strict permissions: `chmod 600 .env`
-- Gmail scope is **read-only** — the app cannot send, delete, or mark emails as read
-- PDFs are stored locally on your VPS only
-- LLM calls send only text snippets, never full binary PDFs
+### Gmail OAuth Issues
+
+**"Access blocked: This app’s request is invalid"**
+- You didn't add your email as a test user in OAuth consent screen
+- Go to APIs & Services → OAuth consent screen → Test users → Add your email
+
+**"Gmail API has not been used in project before or it is disabled"**
+- Gmail API isn't enabled yet. Go to Library → Gmail API → Enable
+- Wait 2-3 minutes after enabling
+
+**"redirect_uri_mismatch"**
+- The redirect URI in your request doesn't match what's in Google Cloud Console
+- Go to Credentials → Your client ID → Add `http://localhost:8080` to Authorized redirect URIs
+
+**Token expired**
+- The `token.json` handles refresh automatically
+- If it fails, delete `token.json` and re-run `python auth.py`
+
+### Telegram Issues
+
+**"Chat not found"**
+- You haven't messaged the bot yet
+- Message `@yourbot /start` first
+
+**"Bot blocked by user"**
+- You blocked the bot. Unblock it in Telegram settings
+
+### Missing Statements
+
+**No emails found**
+- Check if sender address is in `config.py` `BANK_SENDERS`
+- Increase `READ_EMAIL_DAYS_BACK` in `.env`
+- Check Gmail search: `from:hdfcbank.net has:attachment filename:pdf`
+
+**PDF won't open**
+- Check if card is registered with correct last-4 digits
+- Verify cardholder name matches exactly as on card
+- Try the password manually: first 4 letters of name + last 4 digits of card
+
+---
+
+## Updating
+
+```bash
+git pull origin main
+.venv/bin/pip install -r requirements.txt
+```
+
+If database schema changed, you may need to delete `kreditkard.db` and re-register cards (data loss: only registered cards, not parsed bills).
