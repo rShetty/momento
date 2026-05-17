@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+*.db
+*.sqlite
+token.json
+client_secret_*.json
+pdfs/
+*.pdf
+venv/
+.venv/
+.idea/
+.vscode/
