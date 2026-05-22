@@ -42,6 +42,31 @@ def parse_statement(bank_key: str, raw_text: str) -> dict[str, Any] | None:
         result = parse_hdfc_statement(raw_text)
         if result:
             return result
+    if bank_key == "axis":
+        from axis_extractor import parse_axis_statement
+        result = parse_axis_statement(raw_text)
+        if result:
+            return result
+    if bank_key == "icici":
+        from icici_extractor import parse_icici_statement
+        result = parse_icici_statement(raw_text)
+        if result:
+            return result
+    if bank_key == "sbi":
+        from sbi_extractor import parse_sbi_statement
+        result = parse_sbi_statement(raw_text)
+        if result:
+            return result
+    if bank_key == "hsbc":
+        from hsbc_extractor import parse_hsbc_statement
+        result = parse_hsbc_statement(raw_text)
+        if result:
+            return result
+    if bank_key == "yes":
+        from yes_extractor import parse_yes_statement
+        result = parse_yes_statement(raw_text)
+        if result:
+            return result
 
     # ── Generic pattern matching ────────────────────
     result: dict[str, Any] = {"bank_key": bank_key}

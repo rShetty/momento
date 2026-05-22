@@ -33,8 +33,8 @@ READ_EMAIL_DAYS_BACK = int(os.getenv("READ_EMAIL_DAYS_BACK", "30"))
 BANK_SENDERS = {
     "hdfc": [
         "alerts@hdfcbank.net",
-        "Emailstatements.cards@hdfcbank.net",
-        "information@mailers.hdfcbank.net",
+        "Emailstatements.cards@hdfcbank.bank.in",  # actual domain is .bank.in not .net
+        "information@mailers.hdfcbank.bank.in",
     ],
     "axis": ["statements@axisbank.com", "alerts@axisbank.com"],
     "icici": ["alerts@icicibank.com", "credit.cards@icicibank.com"],
@@ -42,27 +42,13 @@ BANK_SENDERS = {
     "amex": ["statements@welcome.aexp.com", "online.statements@aexp.com"],
     "citi": ["alerts@citi.com", "statements@citibank.com"],
     "kotak": ["alerts@kotak.com", "statements@kotak.com"],
-    "indusind": ["statements@indusind.com", "alerts@indusind.com"],
+    "indusind": ["statements@indusind.com", "alerts@indusind.com", "creditcard.estatements@indusind.com"],
     "rbl": ["statements@rblbank.com"],
+    "hsbc": ["statements@hsbc.co.in", "email.statements@hsbc.co.in", "alerts@hsbc.co.in"],
+    "yes": ["statements@yesbank.in", "alerts@yesbank.in"],
+    "federal": ["scapiacards@federalbank.co.in"],  # Scapia Federal Credit Card
+    "sbm": ["estatements@sbmbank.co.in"],
 }
-
-# ── Payment detection keywords ──────────────────
-PAYMENT_KEYWORDS = [
-    "payment received",
-    "credit card payment",
-    "card payment",
-    "upi",
-    "neft",
-    "imps",
-    "rtgs",
-    "autopay",
-    "auto debit",
-    "payment success",
-    "bill payment",
-    "credit card bill",
-    "credited to your card",
-]
-
 
 # ── Payment detection keywords ──────────────────
 PAYMENT_KEYWORDS = [
@@ -113,6 +99,20 @@ BANK_PASSWORD_PATTERNS = {
         "{last4}",
     ],
     "rbl": [
+        "{last4}",
+    ],
+    "hsbc": [
+        "{last4}",           # common: last 4 digits
+        "{first4}{last4}",   # alternative
+    ],
+    "yes": [
+        "{first4}{last4}",   # e.g. RAJE3464
+        "{last4}",           # fallback
+    ],
+    "federal": [
+        "{first4}{last4}",
+    ],
+    "sbm": [
         "{last4}",
     ],
 }

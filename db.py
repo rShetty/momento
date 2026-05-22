@@ -363,3 +363,21 @@ def get_registered_card_by_mask(bank_key: str, card_mask: str) -> dict | None:
 def delete_registered_card(card_id: int) -> None:
     with get_db() as conn:
         conn.execute("DELETE FROM registered_cards WHERE id = ?", (card_id,))
+
+
+def supersede_old_bills(bank_key: str, card_mask: str | None, new_bill_id: int) -> None:
+    """Mark older pending bills for the same card as superseded when a newer statement arrives."""
+    if not card_mask:
+        return
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE bills 
+            SET status = 'superseded' 
+            WHERE bank_key = ? 
+              AND card_mask = ? 
+              AND status = 'pending'
+              AND id != ?
+            """,
+            (bank_key, card_mask, new_bill_id),
+        )

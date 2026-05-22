@@ -4,13 +4,13 @@ from datetime import datetime
 from pathlib import Path
 
 from config import PDF_DIR, READ_EMAIL_DAYS_BACK, all_senders, bank_for_sender, generate_pdf_password
-from db import init_db, save_bill, save_failed_parse, bill_exists, get_registered_cards, get_registered_card_by_mask
+from db import init_db, save_bill, save_failed_parse, bill_exists, get_registered_cards, get_registered_card_by_mask, supersede_old_bills
 from gmail_client import fetch_statement_emails, download_pdf
 from pdf_extractor import extract_text
 from pattern_matcher import parse_statement, llm_fallback, heuristic_fallback
 from pattern_generator import auto_save_patterns_from_llm
 from payment_detector import detect_payments
-from reminder import remind_pending, notify_failure, notify_daily_summary
+from reminder import remind_pending, notify_failure, notify_daily_summary, notify_upload_needed
 
 
 def _try_passwords(pdf_path: Path, bank_key: str) -> str | None:
@@ -51,7 +51,7 @@ def _match_to_registered_card(bank_key: str, parsed: dict) -> dict | None:
 def daily_run() -> dict:
     """
     One full end-to-end run:
-      1. Fetch statement emails
+      1. Fetch statement emails (PDF + link-based)
       2. Download PDFs (try passwords from registered cards)
       3. Parse / learn
       4. Match to registered cards
@@ -82,6 +82,22 @@ def daily_run() -> dict:
             print(f"[main] Unknown sender: {email['sender']}; skipping.")
             continue
 
+        # ── 1a. Link-based (no attachment) ────────
+        if not email["attachments"]:
+            if bank_key == "amex":
+                parsed = _try_parse_link_email(bank_key, email)
+                if parsed:
+                    _save_parsed_bill(bank_key, parsed, pdf_path="", summary=summary)
+                    continue
+                else:
+                    # Ask user to upload PDF manually
+                    notify_upload_needed(bank_key, email)
+                    continue
+            else:
+                print(f"[main] No attachments for {bank_key}; skipping.")
+                continue
+
+        # ── 1b. PDF attachments ───────────────────
         for att in email["attachments"]:
             dest = PDF_DIR / bank_key / f"{email['id']}_{att['filename']}"
             pdf = download_pdf(email["id"], att["attachment_id"], dest)
@@ -111,47 +127,13 @@ def daily_run() -> dict:
             if not parsed:
                 summary["failures"] += 1
                 llm_guess = None
-                # try lightweight LLM just for the summary
                 from llm_client import parse_with_llm_for_amount_due
                 llm_guess = parse_with_llm_for_amount_due(raw_text)
                 save_failed_parse(bank_key, raw_text, str(pdf), llm_guess)
                 notify_failure(bank_key, str(pdf), raw_text[:600], llm_guess)
                 continue
 
-            # ── 4. Match to registered card ─────────
-            registered = _match_to_registered_card(bank_key, parsed)
-            if registered:
-                print(f"[main] Matched to registered card: {registered.get('card_nickname') or registered['cardholder_name']}")
-                card_display_name = registered.get("card_nickname") or registered["cardholder_name"]
-            else:
-                card_display_name = parsed.get("card_name") or bank_key.upper()
-
-            # Normalize
-            amount = parsed.get("amount")
-            due_date = parsed.get("due_date")
-            stmt_date = parsed.get("statement_date")
-
-            due_iso = due_date.isoformat() if due_date else None
-            stmt_iso = stmt_date.isoformat() if stmt_date else None
-
-            if bill_exists(bank_key, stmt_iso, parsed.get("card_mask")):
-                print(f"[main] Bill already exists for {bank_key}/{stmt_iso}; skipping")
-                continue
-
-            bill = {
-                "bank_key": bank_key,
-                "card_name": card_display_name,
-                "card_mask": parsed.get("card_mask"),
-                "statement_date": stmt_iso,
-                "due_date": due_iso,
-                "amount": float(amount) if amount else None,
-                "bill_cycle": parsed.get("bill_cycle"),
-                "pdf_path": str(pdf),
-                "status": "pending",
-            }
-            save_bill(bill)
-            summary["new_bills"] += 1
-            print(f"[main] Saved bill via {method}: {bill}")
+            _save_parsed_bill(bank_key, parsed, pdf_path=str(pdf), summary=summary)
 
     # ── 5. Payment detection ─────────────────────
     payment_actions = detect_payments()
@@ -174,6 +156,52 @@ def daily_run() -> dict:
     )
 
     return summary
+
+
+def _try_parse_link_email(bank_key: str, email: dict) -> dict | None:
+    """For link-based emails (AMEX), try to parse the body text."""
+    raw_text = email.get("body_text", "")
+    if bank_key == "amex":
+        from amex_extractor import parse_amex_email
+        return parse_amex_email(raw_text)
+    return None
+
+
+def _save_parsed_bill(bank_key: str, parsed: dict, pdf_path: str, summary: dict) -> None:
+    """Save a successfully parsed bill to DB."""
+    registered = _match_to_registered_card(bank_key, parsed)
+    if registered:
+        print(f"[main] Matched to registered card: {registered.get('card_nickname') or registered['cardholder_name']}")
+        card_display_name = registered.get("card_nickname") or registered["cardholder_name"]
+    else:
+        card_display_name = parsed.get("card_name") or bank_key.upper()
+
+    amount = parsed.get("amount")
+    due_date = parsed.get("due_date")
+    stmt_date = parsed.get("statement_date")
+
+    due_iso = due_date.isoformat() if due_date else None
+    stmt_iso = stmt_date.isoformat() if stmt_date else None
+
+    if bill_exists(bank_key, stmt_iso, parsed.get("card_mask")):
+        print(f"[main] Bill already exists for {bank_key}/{stmt_iso}; skipping")
+        return
+
+    bill = {
+        "bank_key": bank_key,
+        "card_name": card_display_name,
+        "card_mask": parsed.get("card_mask"),
+        "statement_date": stmt_iso,
+        "due_date": due_iso,
+        "amount": float(amount) if amount else None,
+        "bill_cycle": parsed.get("bill_cycle"),
+        "pdf_path": pdf_path,
+        "status": "pending",
+    }
+    bill_id = save_bill(bill)
+    summary["new_bills"] += 1
+    supersede_old_bills(bank_key, parsed.get("card_mask"), bill_id)
+    print(f"[main] Saved bill: {bill}")
 
 
 if __name__ == "__main__":

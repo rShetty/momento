@@ -1,9 +1,11 @@
 """Telegram bot: command handlers and long-polling runner."""
 
-import asyncio
 import json
+import os
 import re
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,6 +23,9 @@ import db
 from pattern_generator import generate_patterns_from_teach
 from main import daily_run
 from reminder import send_message
+from pdf_extractor import extract_text
+from pattern_matcher import parse_statement, llm_fallback, heuristic_fallback
+from pattern_generator import auto_save_patterns_from_llm
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -36,7 +41,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/teach <bank> due:DD-MM-YYYY amount:XXXX ...`\n"
         "`/confirm <bank> due:XX amount:XX ...`\n"
         "`/patterns <bank>` – show learned patterns\n"
-        "`/history <bank>` – recent bills",
+        "`/history <bank>` – recent bills\n\n"
+        "📎 You can also *send me a PDF* directly to parse a statement!",
         parse_mode="Markdown",
     )
 
@@ -386,6 +392,139 @@ async def delete_card_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"🗑️ Deleted card #{card_id}.")
 
 
+async def upload_pdf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle PDF uploads from user (e.g. AMEX statements downloaded manually).
+    Detects bank from registered cards or filename, tries to parse.
+    """
+    document = update.message.document
+    if not document or not document.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("Please send a PDF file.")
+        return
+
+    chat_id = str(update.effective_chat.id)
+    cards = db.get_registered_cards(user_chat_id=chat_id)
+
+    # Try to infer bank from filename or registered cards conversation
+    bank_key = context.user_data.get("upload_bank")
+    if not bank_key and cards:
+        # If only one card registered, assume that bank
+        if len(cards) == 1:
+            bank_key = cards[0]["bank_key"]
+        else:
+            await update.message.reply_text(
+                "You have multiple cards. Please specify the bank first by sending: `bank:axis` (or hdfc, icici, etc.)"
+            )
+            context.user_data["pending_pdf"] = True
+            return
+
+    if not bank_key:
+        await update.message.reply_text(
+            "Please register a card first with `/register`, or specify the bank."
+        )
+        return
+
+    # Download the PDF
+    file = await context.bot.get_file(document.file_id)
+    tmp_dir = Path(tempfile.gettempdir()) / "kreditkard_uploads"
+    tmp_dir.mkdir(exist_ok=True)
+    dest = tmp_dir / f"{chat_id}_{document.file_name}"
+    await file.download_to_drive(dest)
+
+    await update.message.reply_text(f"📄 Received {document.file_name}. Parsing...")
+
+    # Try passwords
+    bank_cards = [c for c in cards if c["bank_key"] == bank_key]
+    raw_text = None
+
+    # Try without password first
+    try:
+        raw_text = extract_text(dest)
+    except Exception:
+        pass
+
+    # Try each registered card's password
+    if raw_text is None:
+        for card in bank_cards:
+            pw = generate_pdf_password(
+                bank_key, card["cardholder_name"], card["last_4_digits"], card.get("password_hint")
+            )
+            try:
+                raw_text = extract_text(dest, password=pw)
+                break
+            except Exception:
+                continue
+
+    if raw_text is None:
+        await update.message.reply_text(
+            "❌ Could not open the PDF. Is it password-protected? "
+            "Make sure you've registered the card with the correct password hint."
+        )
+        return
+
+    # Parse
+    parsed = parse_statement(bank_key, raw_text)
+    method = "pattern"
+    if not parsed:
+        parsed = llm_fallback(bank_key, raw_text)
+        method = "llm"
+        if parsed:
+            auto_save_patterns_from_llm(bank_key, raw_text, parsed)
+    if not parsed:
+        parsed = heuristic_fallback(bank_key, raw_text)
+        method = "heuristic"
+
+    if not parsed:
+        await update.message.reply_text(
+            "⚠️ Could not parse this statement automatically.\n\n"
+            f"You can teach me with:\n"
+            f"`/teach {bank_key} due:DD-MM-YYYY amount:XXXX stmt:DD-MM-YYYY`"
+        )
+        # Save snippet for teach command
+        from llm_client import parse_with_llm_for_amount_due
+        llm_guess = parse_with_llm_for_amount_due(raw_text)
+        db.save_failed_parse(bank_key, raw_text, str(dest), llm_guess)
+        return
+
+    # Save bill
+    from main import _match_to_registered_card, _save_parsed_bill
+    summary = {"new_bills": 0}
+    _save_parsed_bill(bank_key, parsed, pdf_path=str(dest), summary=summary)
+
+    card_name = parsed.get("card_name") or bank_key.upper()
+    due = parsed.get("due_date", "?")
+    amt = parsed.get("amount")
+    await update.message.reply_text(
+        f"✅ Parsed via *{method}*!\n"
+        f"Card: *{card_name}*\n"
+        f"Due: `{due}`\n"
+        f"Amount: *₹{amt:,.2f}*\n\n"
+        f"Bill saved. Reply `/status` to see all pending dues.",
+        parse_mode="Markdown",
+    )
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch bank hints like 'bank:axis' when a PDF is pending."""
+    text = update.message.text.strip().lower()
+    if context.user_data.get("pending_pdf") and text.startswith("bank:"):
+        bank_key = text.split(":")[1].strip()
+        if bank_key in BANK_SENDERS:
+            context.user_data["upload_bank"] = bank_key
+            context.user_data.pop("pending_pdf", None)
+            await update.message.reply_text(
+                f"Got it. Now send the PDF for *{bank_key.upper()}*.", parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"Unknown bank: `{bank_key}`")
+        return
+
+    # Default: echo help
+    await update.message.reply_text(
+        "I didn't understand that. Send a PDF to parse a statement, or use /help."
+    )
+
+
 def _parse_teach_args(text: str) -> dict:
     """Parse key:value pairs from teach/confirm command text."""
     result: dict = {}
@@ -448,6 +587,11 @@ def main() -> None:
     app.add_handler(CommandHandler("confirm", confirm_cmd))
     app.add_handler(CommandHandler("patterns", patterns_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
+
+    # PDF upload handler
+    app.add_handler(MessageHandler(filters.Document.PDF, upload_pdf_handler))
+    # Catch-all text handler (for bank hints etc)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     print("Bot polling... Press Ctrl+C to stop.")
     app.run_polling()

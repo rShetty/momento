@@ -2,8 +2,10 @@
 
 import base64
 import datetime as dt
+import html
 import json
 import os
+import re
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -78,13 +80,36 @@ def fetch_statement_emails(
     days_back: int = 3,
     max_results: int = 50,
 ) -> list[dict]:
-    """Search Gmail for emails from known senders with PDFs."""
+    """Search Gmail for emails from known senders with PDFs, then also fetch
+    link-based statement notifications (e.g. AMEX) without attachments."""
     service = _get_service()
     after_date = (dt.datetime.utcnow() - dt.timedelta(days=days_back)).strftime("%Y/%m/%d")
 
     from_clause = " OR ".join(f"from:{s}" for s in senders)
-    query = f"has:attachment filename:pdf ({from_clause}) after:{after_date}"
 
+    # Pass 1: emails with PDF attachments
+    query_pdf = f"has:attachment filename:pdf ({from_clause}) after:{after_date}"
+    emails = _fetch_email_list(service, query_pdf, max_results, require_attachments=True)
+
+    # Pass 2: AMEX and other link-based notifications without attachments
+    amex_senders = ["statements@welcome.aexp.com", "online.statements@aexp.com", "alerts@aexp.com"]
+    amex_clause = " OR ".join(f"from:{s}" for s in amex_senders)
+    query_link = f"({amex_clause}) after:{after_date}"
+    link_emails = _fetch_email_list(service, query_link, max_results, require_attachments=False)
+
+    # Merge, avoiding duplicates by message id
+    seen_ids = {e["id"] for e in emails}
+    for e in link_emails:
+        if e["id"] not in seen_ids:
+            emails.append(e)
+
+    return emails
+
+
+def _fetch_email_list(
+    service, query: str, max_results: int, require_attachments: bool
+) -> list[dict]:
+    """Internal: fetch and parse a list of emails from a Gmail query."""
     results = (
         service.users()
         .messages()
@@ -110,9 +135,10 @@ def fetch_statement_emails(
         date_ts = int(msg.get("internalDate", 0)) / 1000
         date_str = dt.datetime.utcfromtimestamp(date_ts).isoformat()
 
-        # walk parts for attachments
         attachments = _list_attachments(payload)
-        if not attachments:
+        body_text = _extract_text_from_payload(payload)
+
+        if require_attachments and not attachments:
             continue
 
         emails.append(
@@ -122,6 +148,7 @@ def fetch_statement_emails(
                 "subject": subject,
                 "date": date_str,
                 "attachments": attachments,
+                "body_text": clean_text(body_text),
                 "snippet": clean_text(msg.get("snippet", "")),
             }
         )
@@ -212,12 +239,20 @@ def fetch_email_body_text(message_id: str) -> str:
 
 
 def _extract_text_from_payload(payload: dict) -> str:
-    """Recursively extract text/plain parts."""
+    """Recursively extract text/plain parts; also strip HTML from text/html parts."""
     mime_type = payload.get("mimeType", "")
     if mime_type == "text/plain":
         data = payload.get("body", {}).get("data", "")
         if data:
             return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        return ""
+    if mime_type == "text/html":
+        data = payload.get("body", {}).get("data", "")
+        if data:
+            html_text = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            text = re.sub(r"<[^>]+>", " ", html_text)
+            text = html.unescape(text)
+            return re.sub(r"\s+", " ", text).strip()
         return ""
     if mime_type.startswith("multipart/"):
         text_parts: list[str] = []

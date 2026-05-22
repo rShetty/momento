@@ -26,6 +26,7 @@ PAYMENT_QUERY_DAYS = 14
 # Bank sender domains to check for debit alerts
 BANK_ALERT_DOMAINS = [
     "alerts@hdfcbank.net",
+    "alerts@hdfcbank.bank.in",
     "alerts@axisbank.com",
     "alerts@icicibank.com",
     "onlinesbi@sbi.co.in",
@@ -57,15 +58,16 @@ def _extract_amount(text: str) -> Decimal | None:
 def _extract_last4(text: str) -> str | None:
     """
     Extract card last-4 digits from debit / payment emails.
-    Handles: ending 3464, **3464, XX5682, XXXX-XXXX-XXXX-1234, •••• 2916
+    Handles: ending 3464, ending **3464, XX5682, XXXX-XXXX-XXXX-1234, •••• 2916
     """
     text = text.lower()
     patterns = [
-        r"ending\s*(?:\*\*)?(\d{4})",
+        r"ending\s*\*?\*?\s*(\d{4})",
         r"\*\*(\d{4})",
         r"xx(\d{4})",
         r"xxxx-xxxx-xxxx-(\d{4})",
         r"[•*]{2,}\s*(\d{4})",
+        r"card\s+ending\s+(\d{4})",
         r"card.{0,15}(\d{4})(?:\D|$)",
     ]
     for pat in patterns:
@@ -128,6 +130,28 @@ def detect_payments() -> list[dict]:
         
         full_text = f"{subject}\n{snippet}\n{body}"
         lower_text = full_text.lower()
+        subject_lower = subject.lower()
+        
+        # ── Skip obvious non-payment emails ──
+        # Skip HDFC purchase alerts (not bill payments)
+        if "a payment was made using your credit card" in subject_lower:
+            continue
+        
+        # Skip UPI transaction alerts (these are purchases, not bill payments)
+        if "you have done a upi txn" in subject_lower:
+            continue
+        if "credited to vpa" in lower_text and "debited from your" in lower_text:
+            continue
+        
+        # Skip statement notifications masquerading as payments
+        statement_subj_kws = ["new statement", "statement is here", "statement generated", 
+                              "view your statement", "smart statement", "bill summary"]
+        payment_subj_kws = ["payment successful", "payment confirmed", "payment received",
+                            "thank you for your payment", "auto debit", "mandate"]
+        has_stmt_subj = any(kw in subject_lower for kw in statement_subj_kws)
+        has_pay_subj = any(kw in subject_lower for kw in payment_subj_kws)
+        if has_stmt_subj and not has_pay_subj:
+            continue
         
         # Extract universal fields
         last4 = _extract_last4(full_text)
@@ -147,12 +171,11 @@ def detect_payments() -> list[dict]:
                 matched_card = card
                 break
         
-        # Find pending bill by card_mask containing last4
-        for bill in pending_bills:
-            mask = bill.get("card_mask") or ""
-            if last4 in mask:
-                matched_bill = bill
-                break
+        # Find pending bills matching last4, prefer most recent statement
+        matching_bills = [b for b in pending_bills if last4 in (b.get("card_mask") or "")]
+        if matching_bills:
+            matching_bills.sort(key=lambda b: b.get("statement_date") or "", reverse=True)
+            matched_bill = matching_bills[0]
         
         if not matched_bill and matched_card:
             # Fallback: match by bank + card nickname
@@ -170,24 +193,49 @@ def detect_payments() -> list[dict]:
         confidence = "low"
         reason_parts = [f"last4={last4}"]
         
-        # Amount exact match → high confidence
+        # Check for payment vs statement signals
+        payment_keywords = ["payment received", "payment successful", "thank you for your payment", 
+                           "payment confirmed", "paid successfully", "credited to your card",
+                           "payment of rs", "payment of ₹", "auto debit", "debited"]
+        statement_keywords = ["new statement", "statement is ready", "view your statement", 
+                             "statement generated", "statement period", "statement date",
+                             "your statement"]
+        
+        has_payment_kw = any(kw in lower_text for kw in payment_keywords)
+        has_statement_kw = any(kw in lower_text for kw in statement_keywords)
+        
+        # Amount exact match → medium confidence (not enough alone)
         bill_amount = matched_bill.get("amount")
+        amount_match = False
         if amount and bill_amount:
             bill_amt = Decimal(str(bill_amount))
             if abs(amount - bill_amt) < Decimal("1.00"):
-                confidence = "high"
+                amount_match = True
                 reason_parts.append(f"exact_amount=₹{amount}")
         
-        # CRED payee → high confidence
-        if payee and "cred" in payee.lower():
-            confidence = "high"
+        # CRED payee → medium confidence (not enough alone, CRED sends both statements and payments)
+        is_cred = payee and "cred" in payee.lower()
+        if is_cred:
             reason_parts.append("payee=CRED")
         
-        # Keywords in text → bump confidence
-        keywords = ["bill payment", "credit card bill", "outstanding", "total amount due"]
-        if any(kw in lower_text for kw in keywords):
+        # High confidence ONLY if:
+        # 1. Has payment keywords AND no statement keywords, OR
+        # 2. Amount match + explicit payment confirmation (not just statement notification)
+        if has_payment_kw and not has_statement_kw:
             confidence = "high"
-            reason_parts.append("keywords=bill_payment")
+            reason_parts.append("keywords=payment_confirmed")
+        elif amount_match and is_cred and not has_statement_kw:
+            # CRED payment without statement keywords
+            confidence = "high"
+            reason_parts.append("cred_payment")
+        elif has_statement_kw:
+            # This is likely a statement notification, not a payment
+            confidence = "low"
+            reason_parts.append("keywords=statement_not_payment")
+        elif amount_match:
+            # Amount matches but no payment confirmation keywords
+            confidence = "medium"
+            reason_parts.append("amount_match_no_payment_kw")
         
         # Only auto-mark if confidence is high
         if confidence != "high":
@@ -200,6 +248,10 @@ def detect_payments() -> list[dict]:
                     "payee": payee,
                 }
             )
+            continue
+        
+        # Skip if already paid/superseded
+        if matched_bill.get("status") != "pending":
             continue
         
         # Mark as paid
